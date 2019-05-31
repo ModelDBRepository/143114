@@ -1,0 +1,1529 @@
+// *****************  LSO model 1.2  **********************
+// ------------  Introduction   --------------------------------  
+// 01/01/2011
+// This model simulates spike interval statistics and ILD responses in the Lateral Superio Olive (LSO) of mammalian brainstem. 
+// Model configurations and simulation methods are described in 
+// Zhou and Colburn (2010) J. Neurophysiology, 103:2355-2371   
+
+// ----- model  -----
+// Leaky Integrate&Fire cell model with Afterhyperpolarization (AHP) chanel
+
+// ----- synapic input  -----
+// Excitory and inhibitory synaptic activity are driven by input spikes described by input function sptimec1_c0
+// alpha synapse, tau1=0.1ms  tau2=1ms
+// 50 on each side
+
+// rate input functions are characterized by exponentials with peak rate c1 (in spk/sec)  
+// c1= [81 351 532 653 734 789 825 850] from 0 to 70dB
+
+// ----- output  -----
+// rate, ISI, gAHP, PSTH, and serial correlation statistics 
+
+// ------------  file structure   ------------------------
+// Part I: Membrane and synapse setup
+// Part II: Data processing and spike-time analyses
+// Part III:load synaptic stimulation inputs 
+// Part IV: User interface setup 
+//---------------------------------------------------------
+
+// ---------- Code start here ----------
+
+seed_x=xred("what is the seed for today", 1, 1, 1000) //string,default,min,max
+
+strdef inputDir,outputDir
+outputDir="output"
+inputDir="input"
+
+
+load_file("nrngui.hoc")
+cvode.active(0)
+
+
+//------ Part I: Membrane and synapse setup ----------
+
+create IF_cell
+access IF_cell
+
+IF_cell {
+	nseg = 1
+       	diam = 20  //um
+       	L = 50    // 1000pi um^2
+       	Ra=150   //ohm.cm
+       	cm=1     //uF/cm2
+        
+       	insert pas
+	
+	e_pas=-65  //mV
+	g_pas=0.001 //0.0004S/cm2  //  tau=1ms->0.001uS    tau=0.2ms->0.005uS     0.25ms->0.004uS
+
+	area_cell=PI*diam*L
+		
+	print "area[um^2]= ",area_cell
+	print "g_pas[S/cm2]=  ",g_pas
+        G_pas=area(0.5)*g_pas/100  //uS
+	print "total axon_conductance[uS]= ",G_pas
+	print "tau_rest[ms]= ",1/(g_pas*1000)
+	print "======================"
+  
+    	
+}
+
+  // add absolute refractory period 
+
+  V_thres=-50   // -50: 15mV above the rest
+
+  objref refrac_abs, netCell_abs
+	refrac_abs=new Refrac_abs(0.5)
+	refrac_abs.tr=2  // absolute RP, if tr>1, may cause next input with smaller tau
+	refrac_abs.e=-65   // [mV] reversal potential
+	refrac_abs.gr=10   //[uS] conductance during absolute refractory period  : 10 times the G_pas
+
+	
+	delays=0
+	weight=0     // not used in *.mod 
+	netCell_abs=new NetCon(&IF_cell.v(0.5),refrac_abs,V_thres,delays,weight)
+
+
+
+
+  // add relative refractory period inside the Cell   : not used in this program -- refrac_ahp serves both
+  
+  objref refrac_rel, netCell_rel
+	refrac_rel=new Refrac_rel(0.5)
+	refrac_rel.tau=5  // the decay time constant
+	refrac_rel.e=-65   // [mV] reversal potential
+	refrac_rel.gr=0   //[uS] conductance after the abs refractory period
+
+	
+	refrac_rel_delay=refrac_abs.tr   // if delay=refrac_abs.tr, then send out signal after the abs refractory 
+	//refrac_rel_delay=0
+	weight=0		// not used in *.mod 
+	netCell_rel=new NetCon(&IF_cell.v(0.5),refrac_rel,V_thres,refrac_rel_delay,weight)
+
+
+  
+  // add AHP conductance 
+  
+  objref refrac_AHP, netCell_AHP
+	refrac_AHP=new Refrac_rel(0.5)
+	refrac_AHP.tau=20  // the decay time constant
+	refrac_AHP.e=-65   // [mV] reversal potential
+	refrac_AHP.gr=0.02   //[uS] conductance after the abs refractory period
+
+	
+	refrac_AHP_delay=refrac_abs.tr    // if delay=refrac_abs.tr, then send out signal after the abs refractory 
+	//refrac_AHP_delay=0
+	weight=0        // not used in *.mod 
+	netCell_AHP=new NetCon(&IF_cell.v(0.5),refrac_AHP,V_thres,refrac_AHP_delay,weight)
+ 
+	//------- END Cell Model -------------------------------------
+ //----------------------------------------------------------
+
+
+
+
+
+  //**** procedure  "noisy current stimulus"  ****** 
+  //---- not used in this model --------------------
+  objref current_inj
+  current_inj=new current_gauss(0.5)
+  current_inj.del=5
+  current_inj.dur=0     
+  current_inj.mean=0
+  current_inj.std0=0.4
+	
+  
+  //------- END current stim -------------------------------------
+  //----------------------------------------------------------
+ 
+
+ 
+
+
+
+  //**** procedure  "stimulus and target connection"  ****** 
+  //---------------------------------------------------------
+  
+  //----     parameter description     ----------------------
+  // 
+  //syn_contra[]: I alpha synapses, each group has 50 synapses 
+  //syn_ipsi[]: E alpha synapses,each group has 50 synapses  
+  //
+  //gen_contra[]: I stimuli to syn_contra[]
+  //gen_ipsi[]: E stimuli to syn_ipsi[]
+  
+  //netcon_contra[]: connection on contra
+  //netcon_ipsi[]: connection on ipsi
+  //
+  
+  
+  
+  syn_number=50   // number of synapses per side
+
+  objectvar syn_contra[syn_number], gen_contra[syn_number]
+  objectvar syn_ipsi[syn_number], gen_ipsi[syn_number]
+
+ 
+  access IF_cell 
+ 
+   //   *** IE   ****************************
+   //----- add spike, virtual spikes
+   for i=0, syn_number-1{
+            gen_contra[i] = new VecStim(0.5)
+		    gen_ipsi[i] = new VecStim(0.5)
+  	} 
+
+ //----- add IE expsyn at Cell
+
+	// contralateral inhibition from MNTB  
+
+	for i=0,syn_number-1 {
+		syn_contra[i] = new Alpha(0.5)  // scatter along the whold dend
+		syn_contra[i].tau1 =0.1  //ms    may add some jitters
+		syn_contra[i].tau2 =1   //ms
+		syn_contra[i].con=3    //nS- mho
+		syn_contra[i].e =-70   // mV
+    
+		}                            //syn.i --- nA
+
+
+   
+	// ipsilateral excitation from AVCN
+  
+ 	for i=0,syn_number-1 {
+		syn_ipsi[i] = new Alpha(0.5)
+		syn_ipsi[i].tau1 =0.1  //ms    may add some jitters
+		syn_ipsi[i].tau2 =1   //ms
+		syn_ipsi[i].con=1.2    //nS-mho
+		syn_ipsi[i].e =0   // mV
+    	}                            //syn.i --- nA
+
+  
+   
+    objref netcon_contra[syn_number],netcon_ipsi[syn_number]
+
+    x_threshold=0.05  // x_threshold doesn't control the firing rates; 
+
+    i_delay_contra=5  //  response delay used to generate E-I ITD. 
+    e_delay_ipsi=5  
+
+   for i=0,syn_number-1  { 
+	netcon_contra[i]=new NetCon(gen_contra[i], syn_contra[i]) 
+	netcon_contra[i].delay=i_delay_contra
+      	netcon_contra[i].weight=0.001  // delay gain[uS]
+
+      	netcon_ipsi[i]=new NetCon(gen_ipsi[i], syn_ipsi[i]) 
+        netcon_ipsi[i].delay=e_delay_ipsi
+        netcon_ipsi[i].weight=0.001  // delay gain[uS]
+       }
+  
+
+  
+  //-------- END connection ---------------------------------
+  //--------- END Part I    ---------------------------------
+
+  
+  
+   
+  // Part II: Data processing and spike-time analyses
+  
+    
+  // *** procedure   "record AP numbers"  ***
+  //-----------------------------------------------
+  //----     parameter description     ------------ 
+  // bin:[ms] bin width of AP
+  // total:   total number of entries recorded in v_all
+  // v_ISI: [ms] record the event time
+  // v_voltage:  record occurrence of event at each dt
+  // pre_E: [ms] record the precell event time of netcon_contra[0]
+  //sptime_out: spike time for all trials, exporting to matlab
+  
+  tstop=200+e_delay_ipsi   // all inputs last 200ms, maximum stim time=300ms 
+  start_ss=40+e_delay_ipsi   // steady state starts at 40 ms  after the E onset; reset in the reset()
+  dt=0.025    // numerical integration time step 
+  bin=0.05 // 50us time bin size, bin AP
+  total=tstop/bin
+  N_run=200
+  
+
+  access IF_cell
+  objref apc,v_ISI,v_voltage,pre_E, sptime_out
+  objref g_AHP
+  
+  v_ISI=new Vector()
+  v_voltage=new Vector(tstop/dt+2,0)
+  pre_E=new Vector()
+  
+  AP_threshold=V_thres  //-50 mV 
+  apc = new APCount(0.5)
+  apc.thresh=AP_threshold
+
+  //==== test output ISI and PS
+  apc.record(v_ISI) //record event time
+  v_voltage.record(&IF_cell.v(0.5),dt) //record the event: event time=index*dt
+  netcon_contra[0].record(pre_E)//record input event time 	
+
+
+  // === monitorthe AHP conductance
+   g_AHP=new Vector(tstop/dt+2,0)   
+   g_AHP.record(&refrac_AHP.g,dt)
+
+  //-------- END record AP ------------------------
+  //-----------------------------------------------
+  
+  
+  
+  
+
+  //****  function  "PSTH"  **** 
+  //-----------------------------------------------
+  //----     parameter description     ------------ 
+  //v_save: bin v_voltage for each run
+  //v_all: summation of all v_save 
+  //v_psth: output PSTH vector
+  //x_psth: AN PSTH vector
+  //t_psth: time axis
+  //v_trigger: spike-triggered avergage of sub-membrane potential 
+
+  
+  objref v_save,v_all,v_psth
+  objref v_trigger, t_trigger, v_average, v_trigger_mean,v_trigger_std,g_trigger, trigger_time
+  objref g_psth,t_psth, v_stand
+  objref zero_pad
+  objref d, xtime
+  objref v_temp
+
+
+  bin_psth=10*bin  //0.5 ms 
+  trigger_length=200*bin  //ms
+
+  nrow_trigger=N_run
+  ncol_trigger=trigger_length/bin
+
+  v_average=new Matrix(nrow_trigger,ncol_trigger)
+
+  proc get_psth() { v_save=new Vector(L_PTH)
+  		v_save.spikebin(v_voltage,AP_threshold) //(v_source, threshold)
+		v_save.rebin(v_save,bin/dt)  // rebin the time axis
+		v_all.add(v_save)   // add all trials, the number of spikes
+		
+		//*******   measure the pre-spike average of membrane potential during the steady-state
+		v_trigger=new Vector(L_PTH,0)
+		t_trigger=new Vector(L_PTH,0)
+		v_trigger.add(v_voltage)
+		t_trigger.spikebin(v_voltage,AP_threshold) // all-none train
+
+		v_trigger.rebin(v_trigger,bin/dt) 
+		v_trigger.div(bin/dt)
+		t_trigger.rebin(t_trigger,bin/dt)  // rebin the time axis
+
+		// only keep the steady-state phase
+		start_index=start_ss/bin-1
+		v_trigger.remove(0, start_index)
+		t_trigger.remove(0, start_index)
+		
+		v_temp=new Vector()
+		v_temp.correl(v_trigger,t_trigger)
+		v_temp=v_temp.c(0,ncol_trigger-1)
+		v_temp.div(t_trigger.sum)   // normalized by number of spikes
+		v_average.setrow(N_run-1, v_temp)
+		
+  	}  
+
+
+
+  proc psth() {
+		length_psth=tstop/bin_psth  //length of period points
+		
+		v_psth=new Vector(v_all.size,0)   
+		v_psth.add(v_all)
+		
+		
+		// rebin the time axis    // can't compress if ratio=1
+		if ( bin_psth > bin ) { v_psth.rebin(v_psth,bin_psth/bin) } 
+			
+		v_psth.div(N_run*bin_psth*0.001)   //  #spikes/bin-> #spikes/ms-> #spikes/sec
+		
+		
+		t_psth=new Vector(length_psth)
+		t_psth.indgen(bin_psth)
+		
+	        v_stand=new Vector(t_psth.size,0)     // dend[0] input PSH
+		v_stand.indgen(bin_psth)
+  		v_stand.apply("inputRate")	
+		
+		// add the stimulus onset time
+		zero_pad=new Vector(e_delay_ipsi/bin_psth,0)
+		a=v_stand.size
+		v_stand.insrt(0, zero_pad) 
+		v_stand.resize(a)
+		
+		g_psth= new Graph()
+		g_psth.size(0,tstop,0,2000)
+  		g_psth.align(0.5,0.2)
+  		g_psth.label(0.9,0.2,"time")
+
+  		g_psth.color(2)
+  		g_psth.label(0.6,0.8,"LSO(#/sec)")
+  		v_psth.plot(g_psth,t_psth,2,2)
+       
+  		
+  		g_psth.color(3)
+  		g_psth.label(0.6,0.6,"InputRate(#/sec)")
+             v_stand.plot(g_psth,t_psth,3,2)
+       		
+		// average overll all trials for spike-triggered potentials
+		v_temp=new Vector()
+		for i=0,ncol_trigger-1 {
+			v_average.getcol(i,v_temp)
+			v_trigger_mean.x[i]=v_temp.mean()
+			v_trigger_std.x[i]=0 //v_temp.stdev()
+			}
+		
+		trigger_time=new Vector(ncol_trigger,0)
+		trigger_time.indgen(bin)
+		
+
+		//g_trigger=new Graph()
+		//g_trigger.size(0,trigger_length,-70,V_thres+1)
+  		//g_trigger.beginline()  
+            //v_trigger_mean.plot(g_trigger,trigger_time,2,2)
+  		//v_trigger_mean.ploterr(g_trigger,trigger_time,v_trigger_std,10,1,2)
+			
+
+  }
+  
+  func inputRate() { //for PSTH
+  
+        return c1_E*exp(-$1/decay_E)+c0_E
+        
+}	
+
+  
+  //---  END function  "PSTH" ---------------------
+  //-----------------------------------------------
+  
+
+ 
+
+  //****  function  "ISI"  **** 
+  //-----------------------------------------------
+  //----     parameter description     ------------ 
+  // get_ISI(): get histogram for each run
+  //v_ISI: record each event time
+  //v1,v2,v1_ss,v2_ss: operating vector 
+  //bin_ISI : bin width of ISI	
+  //hist_ISI: histogram of ISI for all run
+  //hist: histogram of ISI for each run
+  //mean_T, sq_T, num_T: ISI numbers at each run
+  
+  objref v1,v2,v1_ss,v2_ss
+  objref g_AHP_index
+  objref hist_ISI,hist_ISI_ss,hist,hist_ss
+  objref F,recover	
+  
+  objref serialISI,vector_noZero,time_noZero,meanfit_ISI, meanfit_AHP
+
+  objref xtime,xtime_recover,g_ISI,g_serialISI
+  objref mean_T, sq_T, num_T
+  objref temp,t1, temp_ss, temp_count,temp_AHP
+   
+  objref serialAHP, AHP_count
+  objref mean_AHP,sq_AHP
+
+  objref rate_infor
+  
+  mean_ISI=0  // mean T for each run; only use for records
+  
+  OVF=0       // overflow out of topbins
+  EI=0        // entrainment index   
+  
+  mean_ISI_total=0
+  std_ISI=0
+  sq_sum=0
+  CV_ISI=0
+  
+  mean_AHP_total=0
+  std_AHP=0
+
+
+  proc get_ISI() { 
+  		
+		// ****    For the whole section of responses ******
+  		v2=new Vector(L_ISI,0)
+  		v1=new Vector(L_ISI,0)
+  		
+  		
+  		v1.add(v_ISI)
+  		v2.add(v_ISI)
+  		v1.rotate(1) // right shift
+  		v2.sub(v1)
+  		v2.rotate(-1)
+  		v2.resize(v2.size-1)  // cut off the last interval
+  		
+  		
+  		//*** spike times adding all trials 
+  		if (v_ISI.max!=0) sptime_out.append(v_ISI)   
+  		 
+  		 
+  		//*** for calculate the square sum 
+  		temp = new Vector(v2.size,0)
+  		temp.add(v2)
+  		temp.sub(v2.mean)  
+  		
+  		mean_T.x[N_run-1]=v2.mean
+  		num_T.x[N_run-1]=v2.size
+  		sq_T.x[N_run-1]=temp.sumsq()
+  		
+  		mean_ISI=v2.mean + mean_ISI  // mean ISI for each run
+  
+  		print "% rate=",(v2.size+1)/(tstop/interval)
+  		print " spikes=",v2.size+1
+  		print "**********************************"
+  		
+  		hist=v2.histogram(0, topbin+OVFbin, bin_ISI)  //bin width=?
+		
+  		if(hist.size-hist_ISI.size==1) { hist.resize(hist_ISI.size)} 
+  		hist_ISI.add(hist)      // units N_run*spikes/bin_ISI
+
+
+
+
+	// ****    For the steady-state section of responses ******
+  		v2_ss=new Vector(L_ISI,0)
+  		v1_ss=new Vector(L_ISI,0)
+		
+
+
+  		temp = new Vector(L_ISI,0)
+
+		temp.indvwhere(v_ISI, "[]", start_ss, tstop)   // get the indice for spike between start_ss -> tstop
+
+		R40=v_ISI.size-temp.size     // BONUS!! the spikes number for the 40 ms onset phase
+		if(v_ISI.max==0) { R40=0 }  // not saving spikes less than one, but still with error=1 spike
+
+		if(temp.size<=1) { temp=new Vector(2,0) }  // not saving spikes less than one
+
+  		v2_ss = v_ISI.ind(temp)
+  		v1_ss = v_ISI.ind(temp)
+
+  		v1_ss.rotate(1) // right shift
+  		v2_ss.sub(v1_ss)
+  		v2_ss.rotate(-1)
+  		v2_ss.resize(v2_ss.size-1)  // cut off the last interval
+
+		//*** save the indice of g_AHP after a spike(i.e., before refac and the next interval) during the SS
+
+		g_AHP_index=new Vector(L_ISI,0)
+		g_AHP_index=v_ISI.ind(temp)  // the spike times during the SS
+		g_AHP_index.div(dt)          // sp index
+		
+		g_AHP_index.resize(g_AHP_index.size-1)
+
+
+		// *** save the mean and square sum of g_AHP during the SS
+		temp = new Vector(g_AHP.size,0)
+  		temp.add(g_AHP)
+		temp.rotate(-start_ss/dt)  // left shift
+		size_ss=g_AHP.size-start_ss/dt
+		temp.resize(size_ss)
+  		
+		mean_AHP.x[N_run-1]=temp.mean()
+
+ 		temp.sub(temp.mean)  
+  		sq_AHP.x[N_run-1]=temp.sumsq()
+	
+
+
+	// **** measure the serial dependence of ISI for the steady-state
+        serial=1  // the order of serial dependence	
+
+	temp_ss=new Vector(v2_ss.size,0)
+	temp_ss.add(v2_ss)
+	temp_ss.resize(temp_ss.size-serial)  // cut off the last interval, which has no serial ISI following
+		
+	
+
+	for i=0, topbin/bin_ISI {
+		temp = new Vector(200,0)   // for saving the indice 
+		temp.indvwhere(temp_ss,"[)",i*bin_ISI, (i+1)*bin_ISI)   // indice of intervals belongs to each bin
+		
+		temp_AHP=new Vector(200,0)   // for saving the indice of g_AHP for each bin 
+
+		if (temp.size>=1) { 
+			// the  g_AHP that starts at the current interval 
+			AHP_count.x(i)=AHP_count.x(i)+temp.size
+			temp_AHP=g_AHP_index.ind(temp)
+			serialAHP.x(i)=serialAHP.x(i)+g_AHP.ind(temp_AHP).sum   // sum over previous run
+
+			// the next interval
+			temp.add(serial)   
+			temp_count.x(i)=temp_count.x(i)+temp.size
+			serialISI.x(i)=serialISI.x(i)+v2_ss.ind(temp).sum   // sum over previous run
+
+				   } 	
+		}
+	
+
+	// **** measure the histograms 
+	
+		hist_ss=v2_ss.histogram(0, topbin+OVFbin, bin_ISI)  //bin width=0.2
+  		if(hist_ss.size-hist_ISI_ss.size==1) { hist_ss.resize(hist_ISI_ss.size)} 
+  		hist_ISI_ss.add(hist_ss)   // units N_run*spikes/bin_ISI
+
+
+  	}	
+  	
+  	
+  proc ISI() { 
+  		hist_ISI.div(hist_ISI.sum)  //normalize units: prob()
+		OVF=hist_ISI.sum(topbin/bin_ISI+1, (topbin+OVFbin)/bin_ISI-1) // may overflow by T  		
+  		hist_ISI.resize(topbin/bin_ISI+1)
+
+	//******  cut off the first element of sptime 
+		sptime_out.rotate(-1)
+  		sptime_out.resize(sptime_out.size-1) 
+		
+	//******   steady-state   *********  
+		hist_ISI_ss.div(hist_ISI_ss.sum)  //normalize
+		hist_ISI_ss.resize(topbin/bin_ISI+1)		
+		
+		//** Hazard function  : f(x)/[1-F(x)]  : using F(x)=1-F(x)
+
+		F=new Vector(hist_ISI_ss.size-1,0)
+		for i=0, hist_ISI_ss.size-2  {
+			F.x[i]=hist_ISI_ss.sum(i+1,hist_ISI_ss.size-1)	
+		}
+
+		recover=new Vector(hist_ISI_ss.size,0)
+		temp = new Vector(hist_ISI_ss.size,0)
+		temp.indvwhere(F, ">=", 0.05)    // save 1-F(x)  with prob > 0.05  instead of hist_ISI_ss>0.1
+
+		recover=hist_ISI_ss.ind(temp)
+		F.resize(recover.size)
+		recover.div(F)
+
+
+		//*** time axis  
+		xtime=new Vector(hist_ISI.size,0)
+  		xtime.indgen(bin_ISI)
+  		
+		xtime_recover=new Vector(recover.size,0)
+  		xtime_recover.indgen(bin_ISI)
+
+		//** all vairals convert to 1/sec  units  
+                hist_ISI.div(bin_ISI*0.001)
+		hist_ISI_ss.div(bin_ISI*0.001)
+		recover.div(bin_ISI*0.001)
+
+
+
+	//******   serial ISI   *********  
+		serialISI.div(temp_count)
+		
+       //******   serial AHP   *********  
+		serialAHP.div(AHP_count)		
+
+
+    		//******** 
+  		
+  		
+  		g_ISI.size(0,topbin,0,1.2*recover.max)
+  		g_ISI.align(0.5,0.5)
+  		
+  		//g_ISI.label(0.2,0.9,"ISI")
+  		g_ISI.beginline()  
+        
+  		//ISI of the whole responses (not shown)
+  		//hist_ISI.mark(g_ISI,xtime,"o",6,1)    // size 6; color 1
+  		//hist_ISI.line(g_ISI,xtime,1,2)
+		//g_ISI.color(1)
+		//g_ISI.label(0.7,0.2,"whole")  		
+
+		hist_ISI_ss.mark(g_ISI,xtime,"+",6,2)
+  		hist_ISI_ss.line(g_ISI,xtime,2,2)
+		g_ISI.color(2)
+		g_ISI.label(0.7,0.5,"ISIss")    		
+		
+		recover.line(g_ISI,xtime_recover,3,3)   // color 3; size 3
+		g_ISI.color(3)
+		g_ISI.label(0.7,0.9,"Recovery Func") 
+
+
+    //******  plot the serial dependence of ISIs   ***********
+
+		g_serialISI.size(0,topbin,0,1.2*serialISI.max)
+  		g_serialISI.align(0.5,0.5)
+  		
+  		g_serialISI.beginline()  
+		serialISI.mark(g_serialISI,xtime,"o",6,3)
+        g_serialISI.color(3)
+		g_serialISI.label(0.7,0.5,"serial ISIs")    
+
+		serialAHP.mul(100) // zoom in X100
+		serialAHP.mark(g_serialISI,xtime,"+",6,5)
+		serialAHP.div(100) // zoom out X100
+		g_serialISI.color(5)
+		g_serialISI.label(0.7,0.9,"serial AHPs (X100)")    
+
+
+  		//****   calculate the mean and the std of intervals  
+   		t1=new Vector(N_run,0)
+   		t1.add(mean_T)
+   		t1.mul(num_T)
+   		
+   
+   		t2=t1.sum()
+   		mean_ISI_total=t2/num_T.sum()  //overall ISI mean 
+  		
+  		t1=new Vector(N_run,0)
+  		t1.add(mean_T)
+  		t1.sub(mean_ISI_total)
+  		t1.mul(t1)
+  		t1.mul(num_T)
+  		sq_sum=sq_T.sum()+t1.sum()
+  		
+  		if(num_T.sum()>1) {
+  		
+  		std_ISI=sqrt(sq_sum/(num_T.sum-1))   //Overall ISI std
+  		
+  		} else { std_ISI=sqrt(sq_sum) } 
+  		
+  		if(mean_ISI_total>0) {
+  				CV_ISI=std_ISI/mean_ISI_total
+  				} else{ CV_ISI=1
+  					   }            //coefficient of variation
+  		
+
+
+
+
+		//****   calculate the mean and the std of g_AHP during the SS 
+ 
+   		t1=new Vector(N_run,0)
+   		t1.add(mean_AHP)
+   		
+   		mean_AHP_total=t1.mean()  //overall mean(g_AHP) 
+  		
+  		t1.sub(mean_AHP_total)
+  		t1.mul(t1)
+  		t1.mul(size_ss)
+		sq_sum_AHP=sq_AHP.sum()+t1.sum()
+  		std_AHP=sqrt(sq_sum_AHP/(size_ss*N_run))
+  
+   }
+
+  proc meanFit() { 
+		// ** linear fit for the serial_ISI data 
+		temp = new Vector()
+		temp.indvwhere(serialISI, ">", 0)   // fit elements >0
+
+		vector_noZero=new Vector()
+		vector_noZero=serialISI.ind(temp)
+
+		time_noZero=new Vector()
+		time_noZero=xtime.ind(temp)
+
+		meanfit_ISI=new Vector(time_noZero.size,0)
+		p1_ISI=-0.3  // don't choose 0 as the inital value for the fit function
+		p0_ISI=8
+		error = vector_noZero.fit(meanfit_ISI, "line", time_noZero, &p1_ISI, &p0_ISI)
+		print "ISI mean square error=",error
+		strdef fit_func   //p1x+p0
+		sprint(fit_func, "T(n+1)=%2.2fT(n)+%2.2f",p1_ISI,p0_ISI)   
+
+		meanfit_ISI.line(g_serialISI,time_noZero,1,2)  //color 1;  line2
+		g_serialISI.color(3)
+		g_serialISI.label(0.7,0.2,fit_func)       
+
+		
+		// ** linear fit for the serial_AHP data 
+		temp = new Vector()
+		temp.indvwhere(serialAHP, ">", 0)
+
+		vector_noZero=new Vector()
+		vector_noZero=serialAHP.ind(temp)
+
+		time_noZero=new Vector()
+		time_noZero=xtime.ind(temp)
+
+		meanfit_AHP=new Vector(time_noZero.size,0)
+		p1_AHP=0.1  // don't choose 0 as the inital value for the fit function
+		p0_AHP=8
+		error = vector_noZero.fit(meanfit_AHP, "line", time_noZero, &p1_AHP, &p0_AHP)
+		print "AHP mean square error=",error
+		strdef fit_func   //p1x+p0
+		sprint(fit_func, "T(n+1)=%2.2fT(n)+%2.2f",p1_AHP,p0_AHP)   
+
+		meanfit_AHP.line(g_serialISI,time_noZero,1,2)  //color 1;  line2
+		g_serialISI.color(5)
+		g_serialISI.label(0.7,0.9,fit_func)       
+
+
+
+  }
+  
+
+  //****  function  Write to file  **** 
+  //-----------------------------------------------
+  //----     parameter description     ------------ 
+  
+  objref f_hist, f_histss,f_recover,f_serial,f_serialAHP, f_psth, f_rate,f_sptime
+  objref sys_dir  // the output dir	  
+
+        strdef stimulus, level_E,level_I   // declare here first for Neuron reason
+	level_E="B"
+	level_I="B"
+	stimulus="temp"
+
+  proc WriteFile() { local a,b,c
+    chdir("..")
+	chdir(outputDir) 
+
+	a=refrac_abs.tr
+    b=refrac_AHP.gr
+	c=refrac_AHP.tau
+	
+	if (syn_contra[0].con==0 ) {level_I="NAN"}   // ipsi_E level effect only
+
+	strdef stimulus   //abs_AHPg_AHPtau
+	sprint(stimulus, "abs(%2.1f)_AHPg(%2.2f)_AHPtau(%2.1f)_E(%s)_I(%s)",a,b,c,level_E,level_I)  
+	strdef filename   //variable_Level()_stimulus
+	sprint(filename, "hist_%s",stimulus)  
+
+        
+	f_hist=new File(filename)
+        f_hist.wopen()
+        hist_ISI.vwrite(f_hist,4)   
+        f_hist.close()
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "histss_%s",stimulus)   
+        
+	    f_histss=new File(filename)
+        f_histss.wopen()
+        hist_ISI_ss.vwrite(f_histss,4)   
+        f_histss.close()
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "recover_%s",stimulus) 
+        
+	    f_recover=new File(filename)
+        f_recover.wopen()
+        recover.vwrite(f_recover,4)   // sptime output 
+        f_recover.close()
+        
+        
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "serial_%s",stimulus) 
+        
+	    f_serial=new File(filename)
+        f_serial.wopen()
+        serialISI.vwrite(f_serial,4)   
+        f_serial.close()
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "serialAHP_%s",stimulus) 
+        
+	    f_serialAHP=new File(filename)
+        f_serialAHP.wopen()
+        serialAHP.vwrite(f_serialAHP,4)   
+        f_serialAHP.close()
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "psth_%s",stimulus) 
+	    f_psth=new File(filename)
+        f_psth.wopen()
+        v_psth.vwrite(f_psth,4)   
+        f_psth.close()
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "rate_%s",stimulus) 
+	    f_rate=new File(filename)
+        f_rate.wopen()
+        rate_infor.vwrite(f_rate,4)   //rate_infor 
+        f_rate.close()
+
+        //------------------------------------------
+
+	//-----------------------------
+
+	strdef filename
+	sprint(filename, "sptime_%s",stimulus) 
+	    f_sptime=new File(filename)
+        f_sptime.wopen()
+        sptime_out.vwrite(f_sptime,4)   //spike times for all runs
+        f_sptime.close()
+
+    chdir("..")
+	chdir(inputDir)  
+	}	
+
+
+
+
+ //**** procedure "run N-run times, save firing time, compute mean and std of firing rates" ****
+  //---------------------------------------------------
+  //----     parameter description     ------------
+  // N_run: number of trials 
+  // v_AP: firing rates of each run
+  //
+  // rerun() : main function, repeat every tstop
+  // integrate(): integration function
+  // getcon(): upgrade the new synapse information according to syn_contra[0] and syn_ipsi[0]
+  // getstim():upgrade the new stimuli information according to gen_contra[0] and gen_ipsi[0]
+  
+  objref v_AP,v_AP_40,mean_T, sq_T, num_T   // vec for one IPD with N_run 
+  objref mean_AHP,sq_AHP
+  objref rate_infor
+ 
+
+  v_AP=new Vector(N_run,0)    // the whole 200 ms firing rates	
+  v_AP_40=new Vector(N_run,0)  // the 40 ms transient firing rates	
+
+ 
+
+
+interval=4    // Global;  don't change, 
+ 
+proc reset() {
+    N_run=200
+    tstop=200+e_delay_ipsi   // all inputs last 200ms, maximum stim time=300ms 
+    start_ss=40+e_delay_ipsi     // define the start of the steady-state for ISI()
+
+	bin_ISI=bin*4   //  0.2ms  ****!!!!!!!!!!!!!****!!!!!!!!!!!!!
+  	topbin=int(5*interval/bin_ISI)*bin_ISI  // 20 ms for binning and 20 ms for OVF
+  	OVFbin=int(5*interval/bin_ISI)*bin_ISI
+    bin_psth=10*bin  //0.5 ms    !!!!!!!!!!!!!!!!!!!!!!
+ 
+    chooseFile()   // choose current f1,f2
+
+	print "c1_E=[Hz]",c1_E
+	print "c0_E=[Hz]",c0_E
+	print "d_E=[ms]",decay_E
+
+	print "c1_I=[Hz]",c1_I
+	print "c0_I=[Hz]",c0_I
+	print "d_I=[ms]",decay_I
+
+    getcon()
+    getstim()	// resample the AN sptime
+
+  
+  
+//***** reset data vectors   *************	
+    v_AP=new Vector(N_run,0)
+	v_AP_40=new Vector(N_run,0)
+
+  	mean_T=new Vector(N_run,0)
+  	sq_T=new Vector(N_run,0)
+  	num_T=new Vector(N_run,0)
+	
+	mean_AHP=new Vector(N_run,0)
+  	sq_AHP=new Vector(N_run,0)
+  	
+	nrow_trigger=N_run
+    ncol_trigger=trigger_length/bin
+    v_average=new Matrix(nrow_trigger,ncol_trigger)
+	v_trigger_mean=new Vector(ncol_trigger,0)
+	v_trigger_std=new Vector(ncol_trigger,0)
+
+  	
+    R=0
+	R_std=0
+    R40=0
+	R40_std=0
+  	mean_ISI_total=0
+   	std_ISI=0
+   	sq_sum=0
+   	CV_ISI=0
+   
+  	mean_ISI=0  // only for check on the each run
+  	OVF=0
+  	EI=0
+
+
+    mean_AHP_total=0
+	std_AHP=0
+  	
+  	hist_ISI=new Vector((topbin+OVFbin)/bin_ISI+1,0)
+	hist_ISI_ss=new Vector((topbin+OVFbin)/bin_ISI+1,0)
+	serialISI=new Vector (topbin/bin_ISI+1,0)
+	temp_count=new Vector(topbin/bin_ISI+1, 1e-4)
+
+    serialAHP=new Vector (topbin/bin_ISI+1,0)
+	AHP_count=new Vector(topbin/bin_ISI+1, 1e-4)
+
+	v_all=new Vector(tstop/dt+1,0)
+  	v_all.rebin(v_all,bin/dt)
+
+	rate_infor=new Vector(13,0)  
+  	
+
+
+  //==== for record the spike times for all trials
+  sptime_out=new Vector(1,3000)   // the first element is spared later
+  
+  
+  }
+  
+  proc rerun() {
+        
+  	    reset()
+
+
+        while (N_run>0) {
+		getstim()	// resample the AN sptime
+                
+		// reclaim vector otherwise wrong message like  "Segmentation violation" 	
+		v_ISI=new Vector()
+  		v_voltage=new Vector(tstop/dt+2,0)
+		g_AHP=new Vector(tstop/dt+2,0) 
+  		//pre_E=new Vector()
+  		
+
+
+  		//==== for input ISI and PS
+  		//netcon_contra[0].record(v_ISI)//record input event time
+  		
+  		//==== for output ISI and PS
+                apc.record(v_ISI) //record event time
+  		v_voltage.record(&IF_cell.v(0.5),dt) 
+  		
+   		g_AHP.record(&refrac_AHP.g,dt)
+  		
+  		
+  		v_init=-65      
+  		finitialize(v_init) 
+  		fcurrent()
+  		integrate()
+  		get_ISI()
+		get_psth()
+
+        v_AP.x[N_run-1]=apc.n
+		v_AP_40.x[N_run-1]=R40
+		N_run=N_run-1 
+		
+	} 
+
+   N_run=200   // for psth() function
+   
+   R=v_AP.mean()
+   if (v_AP.size>1) { R_std=v_AP.stdev() }
+   R40=v_AP_40.mean()
+   if (v_AP_40.size>1) { R40_std=v_AP_40.stdev() }
+
+   
+   g_ISI.erase_all()
+   g_serialISI.erase_all()
+   
+   ISI()
+   psth()
+
+   
+   // **** just checking  ***********
+ 
+   print "R=",R
+   print "R_std=",R_std
+   
+   print "R40=",R40
+   print "R40_std=",R40_std
+   
+   print "T=", mean_ISI_total
+   print "T_std=", std_ISI
+   print "T_CV=", CV_ISI
+   
+   print "EI=",  EI
+   print "OVF=", OVF
+
+   print "AHP=", mean_AHP_total
+   print "AHP_std=", std_AHP
+//*****  save rate infor into a vector
+
+   
+   rate_infor.x[0]=R
+   rate_infor.x[1]=R_std
+   rate_infor.x[2]=R40
+   rate_infor.x[3]=R40_std
+   rate_infor.x[4]=mean_ISI_total
+   rate_infor.x[5]=std_ISI
+   rate_infor.x[6]=CV_ISI
+   rate_infor.x[7]=OVF
+   rate_infor.x[8]=mean_AHP_total
+   rate_infor.x[9]=std_AHP
+   rate_infor.x[10]=bin_ISI
+   rate_infor.x[11]=bin_psth
+   rate_infor.x[12]=interval
+   	
+   
+   print "\n----------- END -----------------------"
+
+
+
+}
+  
+  
+  proc integrate() {
+    
+    while (t < tstop) {
+    fadvance()  // advance solution 
+    
+  }
+  print "======= info ======="
+  print "N_run=",N_run   // show run time 
+  print "spike number=",apc.n 
+  print "N_input_E=",pre_E.size
+
+  //print "*************"
+  
+  if(v_ISI.size<=1) { v_ISI=new Vector(2,0) }  // not saving spikes less than one
+  L_ISI=v_ISI.size
+  print "L_ISI=",L_ISI
+  L_PTH=v_voltage.size		
+  //print "L_PTH=",L_PTH	
+}
+
+
+//----------  END part II -------------------------
+ 
+
+
+
+ //-------  Part III:load synaptic stimulation inputs ----------
+ 
+ //**** procedure  "import AN spikes file"  ****** 
+ //---------------------------------------------------------
+
+ //----     parameter description     ----------------------
+ // totalAN, spfile: vector and filename for AN spikes times 
+ // index,indexfile: vector and filename for AN spike indice 
+ // n: cooperate index vector
+ // f1: spiketime file; f2: index file
+ // f3: rate file; f4: time axis file
+ // r_contra, r_ipsi: ramdom number used to choose one frame spAN from totalAN
+
+
+strdef  f1_E,f2_E  // sptime file and spindex file for excitation 
+strdef  f1_I,f2_I  // sptime file and spindex file for inhibition 
+
+strdef label, cmd
+
+//strdef level_E,level_I
+
+//***  default file  ***
+f1_E="sptime351_163_5"   
+f2_E="spindex351_163_5"
+
+f1_I="sptime351_163_5"   
+f2_I="spindex351_163_5"
+
+ c1_E=351  //transiet
+ c0_E=163  //sustained
+ decay_E=5    
+ level_E="B"   // a symbolic representatin of levels
+
+
+ c1_I=351  //transiet
+ c0_I=163  //sustained
+ decay_I=5    
+ level_I="B"
+ 
+ 
+ chdir(inputDir)
+ 
+
+proc Rate_E() {   // import ipsi excitatory inputs; used in the ControlPanel
+    sprint(f1_E, "sptime%d_%d_%d",$1,$2,$3)
+    sprint(f2_E, "spindex%d_%d_%d",$1,$2,$3)
+    c1_E=$1
+    c0_E=$2
+    decay_E=$3
+
+	if(c1_E==81)  {level_E="A"}
+	if(c1_E==351) {level_E="B"}
+	if(c1_E==532) {level_E="C"}
+	if(c1_E==653) {level_E="D"}
+	if(c1_E==734) {level_E="E"}
+	if(c1_E==789) {level_E="F"}
+	if(c1_E==825) {level_E="G"}
+	if(c1_E==850) {level_E="H"}
+  
+}
+
+proc Rate_I() {   // import contra inhibitory inputs;used in the ControlPanel
+    sprint(f1_I, "sptime%d_%d_%d",$1,$2,$3)
+    sprint(f2_I, "spindex%d_%d_%d",$1,$2,$3)
+    c1_I=$1
+    c0_I=$2
+    decay_I=$3
+
+	if(c1_I==81)  {level_I="A"}
+	if(c1_I==351) {level_I="B"}
+	if(c1_I==532) {level_I="C"}
+	if(c1_I==653) {level_I="D"}
+	if(c1_I==734) {level_I="E"}
+	if(c1_I==789) {level_I="F"}
+	if(c1_I==825) {level_I="G"}
+	if(c1_I==850) {level_I="H"}
+    
+}
+
+
+//****** Importing input spike times  ***********
+//**** contra: inhibition    ipsi: excitation  *****
+
+objref spfile_contra,indexfile_contra,spfile_ipsi,indexfile_ipsi,n
+objref totalAN_contra, index_contra,totalAN_ipsi, index_ipsi 
+objref r_contra[syn_number],r_ipsi[syn_number]
+
+//** all instance use the same randon index
+r_contra=new Vector(syn_number,0)
+r_ipsi=new Vector(syn_number,0)
+
+
+
+proc chooseFile() {  // change file only when use diff c1,c0,d
+    
+    //**  for the contra inhibitory input
+
+	totalAN_contra=new Vector(1000*300,0)
+	index_contra=new Vector(999,0)   // exclude the first trial among 1000
+
+	spfile_contra=new File() 
+	spfile_contra.ropen(f1_I)
+
+	totalAN_contra.scanf(spfile_contra)  // ASCII file 
+	//totalAN_contra.mul(1000)   // transfer sec to ms
+	spfile_contra.close()
+
+	print "total contra input spikes=", totalAN_contra.size()
+
+	indexfile_contra=new File() 
+	indexfile_contra.ropen(f2_I)
+	index_contra.scanf(indexfile_contra)  // ASCII file 
+	indexfile_contra.close()
+
+	print "total contra input trials=", index_contra.size()
+	n_frame=index_contra.size()+1   // total number of trials from inputspike_noDT.m ; default=999 but could be less
+	
+        for i=0,syn_number-1 {  // pick a trial randomly from total of nframe
+		r_contra[i] = new Random(seed_x+i)
+		r_contra[i].uniform(0, n_frame-2)  // pick outside 0 ~1000, will be out-of-range
+	}  
+
+
+	//---------------------------------------------
+	//**  for the ipsi excitatory  input
+
+	totalAN_ipsi=new Vector(1000*300,0)   // total inputspikes = N_trial*N_spikes/trail   in .m file
+	index_ipsi=new Vector(999,0)
+
+	spfile_ipsi=new File() 
+	spfile_ipsi.ropen(f1_E)
+
+	totalAN_ipsi.scanf(spfile_ipsi)  // ASCII file 
+	//totalAN_ipsi.mul(1000)   // transfer sec to ms
+	spfile_ipsi.close()
+
+	print "total ipsi input spikes=", totalAN_ipsi.size()
+
+	indexfile_ipsi=new File() 
+	indexfile_ipsi.ropen(f2_E)
+	index_ipsi.scanf(indexfile_ipsi)  // ASCII file 
+	indexfile_ipsi.close()
+	print "total ipsi input trials=", index_ipsi.size()
+	n_frame=index_ipsi.size()+1   // total number of trials from inputspike.m [1000]
+	
+
+	for i=0,syn_number-1 {  // each gen has diff random number 
+		r_ipsi[i] = new Random(seed_x+i+10)
+		r_ipsi[i].uniform(0, n_frame-2)
+	}  
+	
+}
+
+//---------------------------------------------------------
+//------------------ end ----------------------------------
+
+
+
+//************ refresh synapse and generator *****
+//---------------------------------------------------------
+
+//----     parameter description     ----------------------
+//spAN_contra, spAN_ipsi: store spike times as vectors 
+//spAN_size_contra,spAN_size_ipsi: store number of spikes, each element will be sent to gen.number
+// MaxRate: maximal average FR/100ms of AN  
+// n: cooperate index vector
+// importAN() : store spikes into vectors
+
+
+  
+  objref spAN_contra[syn_number], spAN_ipsi[syn_number]  //spiketime vectors
+  objref spAN_size_contra,spAN_size_ipsi //sizes
+  
+  proc importAN() {
+  	spAN_size_contra=new Vector(syn_number,0)
+  	spAN_size_ipsi=new Vector(syn_number,0)
+  
+  	for i=0,syn_number-1 {
+  		
+  	   frame_pick=int(r_contra[i].repick())  // var reused, diff frame for each gen
+  	   spAN_size_contra.x[i]=index_contra.x[frame_pick+1]-index_contra.x[frame_pick]  //reused
+  	   spAN_contra[i]= new Vector(spAN_size_contra.x[i],0)
+  	   spAN_contra[i]=totalAN_contra.c(index_contra.x[frame_pick],index_contra.x[frame_pick+1]-1)
+		
+		//printf("i=%d %d\n",i,frame_pick)
+		//spAN_contra[i].printf
+		//print "*******************"
+	}
+
+  	for i=0,syn_number-1 {
+  	   frame_pick=int(r_ipsi[i].repick())  // var reused
+  	   spAN_size_ipsi.x[i]=index_ipsi.x[frame_pick+1]-index_ipsi.x[frame_pick]  //reused
+  	   spAN_ipsi[i]= new Vector(spAN_size_ipsi.x[i],0)
+  	   spAN_ipsi[i]=totalAN_ipsi.c(index_ipsi.x[frame_pick],index_ipsi.x[frame_pick+1]-1)
+  		
+	}	
+  }
+  
+  
+  proc getcon() {
+		for i=0,syn_number-1 {
+		syn_contra[i].con=syn_contra[0].con    //umho
+		syn_ipsi[i].con=syn_ipsi[0].con    //umho
+
+		netcon_contra[i].delay=i_delay_contra
+        	netcon_ipsi[i].delay=e_delay_ipsi
+
+		}
+		print "*******************"
+		print "syn_contra con =",syn_contra[0].con
+		print "syn_ipsi con =",syn_ipsi[0].con
+		print "*******************"
+
+		print "*******************"
+		print "syn_contra delay =",netcon_contra[0].delay
+		print "syn_ipsi delay=",netcon_ipsi[0].delay
+		print "*******************"
+		
+		
+		refrac_abs_delay=0
+		weight=0
+		netCell_abs=new NetCon(&IF_cell.v(0.5),refrac_abs,V_thres,refrac_abs_delay,weight)
+
+  
+		refrac_rel_delay=refrac_abs.tr   // send out signal after the spike
+		weight=0
+		netCell_rel=new NetCon(&IF_cell.v(0.5),refrac_rel,V_thres,refrac_rel_delay,weight)
+		
+		refrac_AHP_delay=refrac_abs.tr    // send out signal after the spike
+		//refrac_AHP_delay=0
+		weight=0
+		netCell_AHP=new NetCon(&IF_cell.v(0.5),refrac_AHP,V_thres,refrac_AHP_delay,weight)
+  }
+
+  proc getstim() {
+  		importAN()  // store new spike times to spAN_contra and spAN_ipsi
+        
+		for i=0, syn_number-1 {
+  		gen_contra[i].play(spAN_contra[i])
+  		gen_ipsi[i].play(spAN_ipsi[i])
+  	        }
+		
+ }
+  //----------- END rerun() -----------------------------------
+  //------------ END Part III ---------------------------------
+  
+  
+
+ 
+//--------  Part IV: set up GUI -----------------
+  //**** information  "synapse and stimuli"  ****
+  //---------------------------------------------
+
+  
+  cvode.active(0)
+  access IF_cell
+  
+  objref syn_con
+  
+  syn_con = new VBox()
+  syn_con.intercept(1)       //all following creations go into the "vbox" box
+
+  xpanel("")
+  xlabel("Cell")
+  xvalue("IF_cell.g[S/cm2]","IF_cell.g_pas")
+  xpanel()
+  
+  xpanel("")
+  xlabel("Refrac_abs")
+  xvalue("refrac_abs.gr[uS]","refrac_abs.gr")
+  xvalue("refrac_abs.e[mV]","refrac_abs.e")
+  xvalue("refrac_abs.tr[ms]","refrac_abs.tr")
+  
+  
+  
+  xlabel("AHP")
+  xvalue("AHP.gr[uS]","refrac_AHP.gr")
+  xvalue("AHP.e[mV]","refrac_AHP.e")
+  xvalue("AHP.tau[ms]","refrac_AHP.tau")
+  
+  xpanel()
+
+  xpanel("")
+  xlabel("Synapse 50/side")
+  xvalue("i_syn_contra[nS]","syn_contra[0].con")
+  xvalue("e_syn_ipsi[nS]","syn_ipsi[0].con")
+  
+  xlabel("synaptic delays[ms]")
+  xvalue("i_delay_contra")
+  xvalue("e_delay_ipsi")
+  xpanel()
+
+  syn_con.intercept(0)       //ends intercept mode
+  syn_con.map("SYN",0,100,-1,50)              //draw the box and its content
+
+
+  //----------------
+  xpanel("ControlPanel")
+  xbutton("Single Run", "rerun()")
+  xbutton("Reset", "reset()")
+  xbutton("Quit", "quit()")
+  xbutton("PSTH","psth()")
+  xbutton("WriteFile","WriteFile()")
+  
+  //***  the InputFile control ***
+  xmenu("Choose E Input Rate")
+
+  	sprint(label, "A(0dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",81,110,5)     
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "B(10dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",351,163,5)
+    	xradiobutton(label, cmd)
+    	
+	sprint(label, "C(20dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",532,256,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "D(30dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",653,313,5)
+    	xradiobutton(label, cmd)
+
+	sprint(label, "E(40dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",734,347,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "F(50dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",789,368,5)
+    	xradiobutton(label, cmd)
+    	
+	sprint(label, "G(60dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",825,380,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "H(70dB)")
+    	sprint(cmd, "Rate_E(%d,%d,%d)",850,388,5)
+    	xradiobutton(label, cmd)
+  	
+  xmenu()
+
+  xmenu("Choose I Input Rate")
+  	
+  	sprint(label, "A(0dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",81,110,5)     
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "B(10dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",351,163,5)
+    	xradiobutton(label, cmd)
+    	
+	sprint(label, "C(20dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",532,256,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "D(30dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",653,313,5)
+    	xradiobutton(label, cmd)
+
+	sprint(label, "E(40dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",734,347,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "F(50dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",789,368,5)
+    	xradiobutton(label, cmd)
+    	
+	sprint(label, "G(60dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",825,380,5)
+    	xradiobutton(label, cmd)
+  	
+  	sprint(label, "H(70dB)")
+    	sprint(cmd, "Rate_I(%d,%d,%d)",850,388,5)
+    	xradiobutton(label, cmd)
+  	
+  	
+  xmenu()
+
+  xpanel(50,100)
+
+
+
+  //----------------
+  objref boxv
+  boxv=new VBox()
+  boxv.intercept(1)
+  xpanel("")
+  xlabel("ISI")
+  g_ISI=new Graph()
+  xpanel()
+  
+  xpanel("")
+  xlabel("serial ISI")
+  g_serialISI=new Graph()
+  xpanel()
+
+  
+
+  boxv.intercept(0)
+  boxv.map("CONTROL",600,50,-1,50)
+  //----------------------------------------------------------------
+
+
+
+
+ 
+  //****  procedure  "reset the resting leaky battery"   ****
+  //----------------------------------------------------------- 
+  
+  v_init=-65
+  celsius=38    
+  reset()
+  finitialize(v_init) 
+  fcurrent()  // make sure that leak current balance the non-leak current
+  print "total axon_conductance[uS]= ",G_pas
+  print "tau_rest[ms]= ",1/(g_pas*1000)
+
+  print "interval=[ms]", interval
+  print "bin_ISI=[ms]",bin_ISI
+  print "bin_psth=[ms]",bin_psth
+  
+  //-------- END -----------------------------------------
+ 
+
+
+  
